@@ -1,0 +1,14 @@
+# Backend Secrets & Heavy Dependencies
+backend/node_modules/
+backend/.env
+backend/bexit-service-account-key.json
+
+# PlatformIO Compiled Build Files
+firmware/.pio/
+firmware/.vscode/
+firmware/.clang-format
+
+# Logs & System Files
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,19 @@
+# Bed-Exit Alert System
+
+An end-to-end medical bed exit monitoring system using ESP32-C5 microcontrollers, MQTT, Firebase RTDB, and Telegram.
+
+## Quick Start Guide
+
+### 1. Backend Setup
+1. Open terminal: `cd backend`
+2. Install dependencies: `npm install`
+3. Configure `.env` with your API secrets.
+4. Place your Firebase `bexit-service-account-key.json` into `/backend`.
+5. Start server: `npm start`
+
+### 2. Dashboard Access
+Open `http://localhost:3000` in your web browser.
+
+### 3. Firmware Flashing
+1. Open `/firmware` folder in VS Code with PlatformIO.
+2. Build and upload to ESP32-C5 via USB.

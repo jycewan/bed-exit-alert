@@ -1,0 +1,17 @@
+{
+  "name": "bed-exit-backend",
+  "version": "1.0.0",
+  "description": "Backend engine and Telegram integration for Bed Exit Monitor",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "dev": "nodemon bridge.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "firebase-admin": "^11.11.1",
+    "mqtt": "^5.1.0"
+  }
+}

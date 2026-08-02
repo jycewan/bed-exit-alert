@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Bed Exit Monitor — Ward Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .bed-card { transition: all 0.3s ease; border-left: 10px solid #6c757d; }
+    .status-IDLE { border-left-color: #198754; background-color: #ffffff; }
+    .status-ALERT { border-left-color: #dc3545; background-color: #f8d7da; animation: pulse 1s infinite; }
+    .status-CARE_PAUSE { border-left-color: #ffc107; background-color: #fff3cd; }
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+  </style>
+</head>
+<body class="bg-light p-4">
+  <div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h2>🏥 Live Ward Bed Monitor</h2>
+      <span class="badge bg-primary fs-6" id="status-badge">Connecting to Firebase...</span>
+    </div>
+    <div id="bed-container" class="row g-3"></div>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js";
+    import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js";
+
+    const firebaseConfig = {
+      databaseURL: "https://bed-exit-alert-default-rtdb.asia-southeast1.firebasedatabase.app"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    const badge = document.getElementById('status-badge');
+    const container = document.getElementById('bed-container');
+
+    onValue(ref(db, 'beds'), (snapshot) => {
+      badge.textContent = "Live Feed Connected";
+      badge.className = "badge bg-success fs-6";
+
+      const beds = snapshot.val();
+      container.innerHTML = '';
+
+      if (!beds) {
+        container.innerHTML = `<div class="col-12"><p class="text-muted">No active beds detected.</p></div>`;
+        return;
+      }
+
+      for (let bedId in beds) {
+        const bedData = beds[bedId];
+        const status = bedData.status || { state: 'IDLE', timestamp: Date.now() };
+        const hwState = bedData.hardware || 'OFFLINE';
+
+        const card = document.createElement('div');
+        card.className = 'col-md-4';
+        
+        card.innerHTML = `
+          <div class="card bed-card status-${status.state} p-3 shadow-sm">
+            <div class="d-flex justify-content-between align-items-center">
+              <h4>Bed ${bedId}</h4>
+              <span class="badge ${hwState === 'ONLINE' ? 'bg-success' : 'bg-danger'}">${hwState}</span>
+            </div>
+            <p class="mb-1 mt-2"><strong>Status:</strong> ${status.state}</p>
+            <small class="text-muted">Last Updated: ${new Date(status.timestamp).toLocaleTimeString()}</small>
+          </div>
+        `;
+        container.appendChild(card);
+      }
+    });
+  </script>
+</body>
+</html>
