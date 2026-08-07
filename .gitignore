@@ -2,6 +2,7 @@
 backend/node_modules/
 backend/.env
 backend/bexit-service-account-key.json
+backend/src/secrets.h
 
 # PlatformIO Compiled Build Files
 firmware/.pio/
