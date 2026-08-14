@@ -6,7 +6,7 @@
 #include <WiFiMulti.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
-
+#include "secrets.h"  // defines MQTT_USER, MQTT_PASS — gitignored, not committed
 
 // PIN CONFIG
 #define RGB_PIN        27
@@ -16,10 +16,17 @@
                                  // Wire a pushbutton between this pin and GND (uses internal pull-up,
                                  // no external resistor needed). Pick any free GPIO on your board —
                                  // this just needs to not collide with SENSOR_PIN or the debounce circuit.
+                                 // Confirmed against the ESP32-C5 datasheet: GPIO9 is NOT a strapping
+                                 // pin on this chip (unlike the ESP32-C3, where GPIO9 IS the boot-mode
+                                 // strap - that's a different chip's convention, not this one). C5 boot
+                                 // mode strapping lives on GPIO26/27/28 instead. GPIO9 is an ordinary
+                                 // GPIO here, safe to use for this button. Needs an external pushbutton
+                                 // wired between this pin and GND - nothing on the devkit is connected
+                                 // to it out of the box, and this is NOT the onboard BOOT button (that
+                                 // one is wired to the chip's actual strapping pins for firmware
+                                 // flashing and shouldn't be reused for this).
 
 Adafruit_NeoPixel rgb(NUM_LEDS, RGB_PIN, NEO_GRB + NEO_KHZ800);
-
-#include "secrets.h"  // defines MQTT_USER, MQTT_PASS — gitignored, not committed
 
 // Official Let's Encrypt ISRG Root X1 (Raw String Literal Format)
 const char* HIVEMQ_CA_CERT = R"(-----BEGIN CERTIFICATE-----
@@ -55,15 +62,34 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----)";
 
 
+// STABLE DEVICE IDENTITY — derived from the ESP32's factory-programmed eFuse
+// MAC, never written to NVS and therefore immune to both a Bed ID rename
+// (portal) and a FACTORY_RESET (prefs.clear() below). MQTT topics and the
+// Firebase record for this physical device are keyed off THIS, not the
+// human-editable Bed ID label - so renaming a bed no longer makes the
+// bridge treat it as a brand new device and orphan the old dashboard entry.
+// (The hex digits come straight out of the 48-bit eFuse MAC integer, not
+// necessarily in the same byte order printed by WiFi.macAddress() - that
+// doesn't matter here, it only needs to be unique and stable, which it is.)
+char device_id[13]; // 12 hex chars + null terminator
+
+void computeDeviceId() {
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(device_id, sizeof(device_id), "%012llX", (unsigned long long)mac);
+}
+
 // DYNAMIC BED ID — stored in NVS (flash) via Preferences, independent of
 // WiFiManager's own saved Wi-Fi credentials. This is what actually fixes
 // "typed 01, got 101 back": previously the portal only ran (and only ever
 // saved anything) on a fresh/reset Wi-Fi setup. Now the Bed ID is loaded
 // from Preferences BEFORE the portal is built, so autoConnect() reconnecting
 // silently no longer overwrites it back to a compiled-in default.
+// NOTE: this is now purely a human-facing LABEL, published separately on a
+// retained bed/{device_id}/label topic - it no longer appears in any MQTT
+// topic or Firebase path itself, so renaming it can't orphan anything.
 Preferences prefs;
 char custom_bed_id[16] = "101"; // fallback ONLY if nothing has ever been saved
-WiFiManagerParameter custom_bed_id_param("bed_id", "Bed ID (e.g. 101)", custom_bed_id, 16);
+WiFiManagerParameter custom_bed_id_param("bed_id", "Bed Label (e.g. 101) - can be renamed anytime", custom_bed_id, 16);
 
 // Backup Wi-Fi network - editable from the same portal as Bed ID, stored in
 // NVS, optional (blank = no backup registered). Password field is masked
@@ -183,11 +209,11 @@ void handleMqttConnection() {
     if (now - lastMqttRetry > 5000) {
       lastMqttRetry = now;
       char statusTopic[32];
-      snprintf(statusTopic, sizeof(statusTopic), "bed/%s/status", custom_bed_id);
+      snprintf(statusTopic, sizeof(statusTopic), "bed/%s/status", device_id);
 
 
       char clientId[32];
-      snprintf(clientId, sizeof(clientId), "esp32-c5-bed-%s", custom_bed_id);
+      snprintf(clientId, sizeof(clientId), "esp32-c5-bed-%s", device_id);
 
 
       Serial.print("Connecting to HiveMQ Cloud as ");
@@ -211,8 +237,17 @@ void handleMqttConnection() {
         }
 
         char cmdTopic[32];
-        snprintf(cmdTopic, sizeof(cmdTopic), "bed/%s/cmd", custom_bed_id);
+        snprintf(cmdTopic, sizeof(cmdTopic), "bed/%s/cmd", device_id);
         mqttClient.subscribe(cmdTopic);
+
+        // Republish the current label (retained) on every (re)connect, not
+        // just once - this is how the bridge learns/updates the human-facing
+        // name for this device_id without it ever appearing in a topic path.
+        // Retained + republished on reconnect means even a bridge restart
+        // that happens between two device reconnects still picks it up.
+        char labelTopic[32];
+        snprintf(labelTopic, sizeof(labelTopic), "bed/%s/label", device_id);
+        mqttClient.publish(labelTopic, custom_bed_id, true);
       } else {
         Serial.print("MQTT connection failed. State: ");
         Serial.println(mqttClient.state());
@@ -227,7 +262,7 @@ void handleMqttConnection() {
 
 void publishState(SensorState state) {
   char exitTopic[32];
-  snprintf(exitTopic, sizeof(exitTopic), "bed/%s/exit", custom_bed_id);
+  snprintf(exitTopic, sizeof(exitTopic), "bed/%s/exit", device_id);
 
   setLedForState(state);
 
@@ -267,10 +302,19 @@ void publishState(SensorState state) {
 //   "OPEN_PORTAL"              -> reboot into the setup portal (same as holding the button)
 //   "FORCE_RECONNECT"          -> drop Wi-Fi now, let wifiMulti retry immediately
 //   "SET_BACKUP_WIFI:ssid:pw"  -> save + register a new backup network live, no reboot
-//   "FACTORY_RESET"            -> erase saved Wi-Fi + Bed ID + backup Wi-Fi, reboot into
+//   "SET_LABEL:newlabel"       -> save + republish the Bed Label live, no reboot - this is
+//                                 what lets the admin dashboard rename a bed WITHOUT anyone
+//                                 touching the physical device's boot portal (see admin-routes.js).
+//                                 Same offline caveat as every command here: if this device
+//                                 isn't reachable over MQTT right now, nothing happens.
+//   "FACTORY_RESET"            -> erase saved Wi-Fi + Bed Label + backup Wi-Fi, reboot into
 //                                 the boot portal as if freshly flashed. Irreversible -
 //                                 whatever bed this was assigned to has to be re-provisioned
-//                                 by hand at the device afterward.
+//                                 by hand at the device afterward. device_id is NOT stored in
+//                                 the "bexit" NVS namespace this wipes - it's re-derived from
+//                                 the eFuse MAC every boot, so this device keeps reporting
+//                                 under the same Firebase/MQTT identity it always has, just
+//                                 with the label reset to the "101" default until relabeled.
 void handleRemoteCommand(String payload) {
   payload.trim();
 
@@ -317,6 +361,32 @@ void handleRemoteCommand(String payload) {
       Serial.println("Remote command: SET_BACKUP_WIFI - malformed payload (expected ssid:password), ignored");
     }
 
+  } else if (payload.startsWith("SET_LABEL:")) {
+    String newLabel = payload.substring(strlen("SET_LABEL:"));
+    newLabel.trim();
+    // sizeof(custom_bed_id) is 16 (matches the portal field's own buffer) -
+    // strictly less than, so there's always room for the null terminator.
+    if (newLabel.length() > 0 && newLabel.length() < sizeof(custom_bed_id)) {
+      newLabel.toCharArray(custom_bed_id, sizeof(custom_bed_id));
+
+      prefs.begin("bexit", false);
+      prefs.putString("bed_id", custom_bed_id);
+      prefs.end();
+
+      // Republish retained immediately rather than waiting for the next
+      // reconnect - this is what makes the dashboard's rename feel live
+      // instead of "changed, but only takes effect whenever this device
+      // happens to reconnect next."
+      char labelTopic[32];
+      snprintf(labelTopic, sizeof(labelTopic), "bed/%s/label", device_id);
+      mqttClient.publish(labelTopic, custom_bed_id, true);
+
+      Serial.print("Remote command: SET_LABEL - bed label updated to ");
+      Serial.println(custom_bed_id);
+    } else {
+      Serial.println("Remote command: SET_LABEL - empty or too-long label, ignored");
+    }
+
   } else {
     Serial.print("Remote command: unrecognized payload ignored: ");
     Serial.println(payload);
@@ -329,6 +399,10 @@ void setup() {
   Serial.begin(115200);
   delay(1000); // give native USB CDC time to start
   Serial.println("\n--- ESP32-C5 BED ALERT SYSTEM STARTING (supervised EOL sensor) ---");
+
+  computeDeviceId(); // fixed hardware identity - independent of anything in NVS
+  Serial.print("Device ID (fixed): ");
+  Serial.println(device_id);
 
 
   rgb.begin();
@@ -360,7 +434,7 @@ void setup() {
   // it here so it doesn't force the portal open on every future boot too.
   bool remoteForcePortal = prefs.getBool("force_portal", false);
   if (remoteForcePortal) prefs.putBool("force_portal", false);
-
+  prefs.end();   // closed before radio init starts (see NVS-contention note in project log)
 
   WiFiManager wm;
   // wm.resetSettings(); // keep commented out so it remembers Wi-Fi!
@@ -371,8 +445,14 @@ void setup() {
   // saved in flash without needing to actually be connected.
   String statusHtml = "<p style='margin-bottom:12px'><b>Currently saved Wi-Fi:</b> "
                        + (wm.getWiFiSSID().length() ? wm.getWiFiSSID() : String("(none saved)"))
-                       + "<br><b>Current Bed ID:</b> " + String(custom_bed_id) + "</p>";
+                       + "<br><b>Current Bed Label:</b> " + String(custom_bed_id)
+                       + "<br><b>Device ID (fixed):</b> " + String(device_id) + "</p>";
   WiFiManagerParameter statusDisplay(statusHtml.c_str());
+  
+  custom_bed_id_param.setValue(custom_bed_id, 16);
+  custom_backup_ssid_param.setValue(custom_backup_ssid, 33);
+  custom_backup_pass_param.setValue(custom_backup_pass, 65);
+  
   wm.addParameter(&statusDisplay);
   wm.addParameter(&custom_bed_id_param);
   wm.addParameter(&custom_backup_ssid_param);
@@ -383,9 +463,23 @@ void setup() {
     setLedColor(0, 0, 255); // Blue: AP setup mode active
   });
 
+  // Authoritative "the ESP32 actually received and saved this" signal -
+  // fires only when a submission genuinely reaches and is processed by the
+  // device, independent of whatever the browser/phone shows. A phone
+  // roaming off the no-internet BedAlert-Setup AP mid-request can show its
+  // own "done" page without the ESP32 ever getting the data - this
+  // callback is the only trustworthy confirmation, since it comes from the
+  // device itself rather than the client.
+  bool configWasSaved = false;
+  wm.setSaveConfigCallback([&configWasSaved]() {
+    configWasSaved = true;
+    Serial.println(">>> Config actually received and saved by ESP32 <<<");
+    setLedColor(0, 255, 255); // Cyan: confirmed save, distinct from every other status color
+    delay(1500); // held long enough to actually see it before the board moves on
+  });
 
   wm.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-  wm.setConfigPortalTimeout(180);
+  wm.setConfigPortalTimeout(300); // was 180 - 3 minutes was too tight to reliably connect + submit
 
 
   // Hold the config button during boot to reopen the portal WITHOUT
@@ -399,37 +493,54 @@ void setup() {
   if (forcePortal) {
     Serial.println("Config button held at boot - opening setup portal (Wi-Fi kept)");
     setLedColor(0, 0, 255); // Blue: setup mode, matches AP callback color
+
     connected = wm.startConfigPortal("BedAlert-Setup");
+
   } else {
     connected = wm.autoConnect("BedAlert-Setup");
   }
 
+  // Persist any submitted custom params BEFORE checking whether Wi-Fi
+  // actually connected. configWasSaved firing already means the ESP32
+  // itself received and parsed the POST - that's a done deal regardless of
+  // what happens next. Previously this NVS write only ran on the connected
+  // path below, so submitting just a Bed ID change (leaving the Wi-Fi
+  // fields blank/unchanged) while the AP happened to have a transient
+  // hiccup reconnecting would hit "connected == false" and restart the
+  // board WITHOUT ever writing bed_id to flash - the portal showed the
+  // cyan "saved" confirmation, but the change silently never made it to
+  // NVS, and the next boot came back showing the old value. Saving here,
+  // ahead of the restart branch, means a submission that was genuinely
+  // received can no longer be lost to an unrelated Wi-Fi reconnect failure.
+  if (configWasSaved) {
+    prefs.begin("bexit", false);
+
+    strcpy(custom_bed_id, custom_bed_id_param.getValue());
+    if (savedId != custom_bed_id) {
+      prefs.putString("bed_id", custom_bed_id);
+      Serial.print("Bed ID saved to flash: ");
+      Serial.println(custom_bed_id);
+    }
+
+    strcpy(custom_backup_ssid, custom_backup_ssid_param.getValue());
+    strcpy(custom_backup_pass, custom_backup_pass_param.getValue());
+    if (savedBackupSsid != custom_backup_ssid || savedBackupPass != custom_backup_pass) {
+      prefs.putString("backup_ssid", custom_backup_ssid);
+      prefs.putString("backup_pass", custom_backup_pass);
+      Serial.println("Backup WiFi credentials saved to flash");
+    }
+    prefs.end();
+  }
 
   if (!connected) {
-    Serial.println("Failed to connect or setup timed out. Restarting...");
+    if (configWasSaved) {
+      Serial.println("Config was saved (and already written to flash above), but WiFi connection with those credentials failed. Restarting...");
+    } else {
+      Serial.println("Portal timed out with no submission received - restarting to try again.");
+    }
     delay(3000);
     ESP.restart();
   }
-
-
-  // Only overwrite the saved Bed ID if the portal actually ran and the
-  // field differs from what's saved — an autoConnect() silent reconnect
-  // never touches custom_bed_id_param, so this is a no-op in that case.
-  strcpy(custom_bed_id, custom_bed_id_param.getValue());
-  if (savedId != custom_bed_id) {
-    prefs.putString("bed_id", custom_bed_id);
-    Serial.print("Bed ID saved to flash: ");
-    Serial.println(custom_bed_id);
-  }
-
-  strcpy(custom_backup_ssid, custom_backup_ssid_param.getValue());
-  strcpy(custom_backup_pass, custom_backup_pass_param.getValue());
-  if (savedBackupSsid != custom_backup_ssid || savedBackupPass != custom_backup_pass) {
-    prefs.putString("backup_ssid", custom_backup_ssid);
-    prefs.putString("backup_pass", custom_backup_pass);
-    Serial.println("Backup WiFi credentials saved to flash");
-  }
-  prefs.end();
 
 
   // Register networks for automatic failover: the primary one WiFiManager
@@ -493,8 +604,13 @@ void loop() {
   SensorState reading = classify(raw);
 
 
-  // Dead-zone reading (noise / transition) - ignore entirely, don't disturb debounce timer
+  // Dead-zone reading (noise / transition). Also reset the debounce
+  // candidate/timer here, not just skip - otherwise a noisy sample sitting
+  // between two valid same-state readings doesn't reset the 50ms window,
+  // so the debounce no longer guarantees a truly continuous stable read.
   if (reading == STATE_UNKNOWN) {
+    lastReadState = STATE_UNKNOWN;
+    lastDebounceTime = millis();
     return;
   }
 
