@@ -1,14 +1,20 @@
 # Backend Secrets & Heavy Dependencies
-backend/node_modules/
-backend/.env
-backend/bexit-service-account-key.json
+bed-exit-backend/node_modules/
+bed-exit-backend/.env
+# Firebase service account key
+bed-exit-backend/bed-exit-alert-firebase-adminsdk-fbsvc-b909edf899.json
+
+bed-exit-firmware/src/secrets.h
 
 # PlatformIO Compiled Build Files
-firmware/.pio/
-firmware/.vscode/
-firmware/.clang-format
+bed-exit-firmware/.pio/
+bed-exit-firmware/.vscode/
+bed-exit-firmware/.clang-format
 
 # Logs & System Files
 *.log
 .DS_Store
 Thumbs.db
+
+# Wildcard - Ignore any Firebase Admin SDK keys specifically
+*-adminsdk-*.json
